@@ -26,8 +26,11 @@ def lambda_handler(event, context):
     pd.options.mode.chained_assignment = None  # default='warn'
 ###################################################################################################################################
 ##  user defined variables, assign to paramenter store
-    cbc_name_list = {"cbc01" : 41, "cbc02": 27, "cbc03": 32, "cbc04" :14}  
+    cbc_name_list = {"cbc01" : ["Feinstein_CBC01", 41], "cbc02": ["UMN_CBC02", 27], "cbc03": ["ASU_CBC03", 32], "cbc04": ["Mt_Sinai_CBC04",14]}  
+
     passing_msg = ("File is a valid Zipfile. No errors were found in submission. Files are good to proceed to Data Validation")
+    pass_bucket = "seronet-trigger-submissions-passed"
+    fail_bucket = "seronet-demo-submissions-failed"
 ###################################################################################################################################
     #set up success and failure slack channel
     slack_fail = ssm.get_parameter(Name="failure_hook_url", WithDecryption=True).get("Parameter").get("Value")
@@ -35,11 +38,13 @@ def lambda_handler(event, context):
 
     bucket = event["Records"][0]["s3"]["bucket"]["name"]
     file_path = event["Records"][0]["s3"]["object"]["key"]
-    print(f"Submission was triggered off the file: {file_path}")
     # Accrual_Need_To_Validate/cbc01/2023-04-20-12-59-25/submission_007_Prod_data_for_feinstein20230420_VaccinationProject_Batch9_shippingmanifest.zip/File_Validation_Results/Result_Message.txt
     
     curr_cbc = file_path.split("/")[1]
     sub_name = file_path.split("/")[3][15:]
+    site_name = cbc_name_list[curr_cbc][0]
+    
+    print(f"Submission was triggered off the file: {file_path}")
     
     template_path = file_path.split("/")[0] + "/Accrual_Templates"
     template_files = s3_client.list_objects_v2(Bucket=bucket, Prefix=template_path)["Contents"]
@@ -64,7 +69,8 @@ def lambda_handler(event, context):
     if result_message != passing_msg:
         email_msg = "1) Analysis of the Zip File: Failed\n " + result_message
         email_msg = email_msg + "\n\n Please correct and resubmit the accrual submission"
-        send_error_email(ssm, sub_name, [], [], email_msg, slack_pass, slack_fail)     # Failed File-Validation, send email asking to resubmit
+        send_error_email(ssm, sub_name, [], [], email_msg, slack_pass, slack_fail, bucket, file_path, 
+                         pass_bucket, fail_bucket, s3_client, s3_resource, site_name)     # Failed File-Validation, send email asking to resubmit
         return
     else:
         email_msg = "1) Analysis of the Zip File: Passed"
@@ -95,7 +101,8 @@ def lambda_handler(event, context):
                                   f"\n      Files: {missing_str} were expected but are missing." +
                                   f"\n      Files: {extra_str} were found and not correct." +
                                   "\n\n Please correct file names and resubmit the accrual submission")
-        send_error_email(ssm, sub_name, [], [], email_msg, slack_pass, slack_fail)     #retreive file and add to email as attachment
+        send_error_email(ssm, sub_name, [], [], email_msg, slack_pass, slack_fail, bucket, file_path,
+                         pass_bucket, fail_bucket, s3_client, s3_resource, site_name)     #retreive file and add to email as attachment
         return
 ######################################################################################################################################
 ## validation step 2: ensure that column names in files match templates provided (spelling and puncutaion matter)
@@ -113,7 +120,8 @@ def lambda_handler(event, context):
         email_msg = email_msg + "\n\n Please correct file names and resubmit the accrual submission"
         
         error_key = file_path.replace("File_Validation_Results/Result_Message.txt", "Data_Errors/Column_Errors_Found.csv")
-        make_attachment(ssm, sub_name, s3_client, erorr_list, bucket, error_key, email_msg, "Column_Errors_Found.csv", slack_pass, slack_fail)
+        make_attachment(ssm, sub_name, s3_client, erorr_list, bucket, error_key, email_msg,
+                        "Column_Errors_Found.csv", slack_pass, slack_fail, file_path, pass_bucket, fail_bucket, s3_resource, site_name)
         return
 ######################################################################################################################################
 ## validation step 3: ensure that participants and visits align across the sheets
@@ -124,13 +132,15 @@ def lambda_handler(event, context):
     acc_vaccine_data["Visit_Number"] = [int(i) for i in acc_vaccine_data["Visit_Number"]]
 
     check_part = acc_participant_data[["Research_Participant_ID", "Age"]].merge(acc_visit_data[["Research_Participant_ID"]], on="Research_Participant_ID", how="outer", indicator="Part_Visit")            
-    error_data_1 = check_part.query("Part_Visit == 'left_only")
-    error_data_2 = check_part.query("Part_Visit == 'right_only")
+    error_data_1 = check_part.query("Part_Visit == 'left_only'")
+    error_data_2 = check_part.query("Part_Visit == 'right_only'")
     part_errors_1 = pd.DataFrame({"Research_Participant_ID": error_data_1["Research_Participant_ID"], "Visit_Num": 'All',
                                   'Error_Message': "Participant has a Demographic Data, but missing coresponding visit in Accrual_Visit_Info.csv "})
                                   
     part_errors_2 = pd.DataFrame({"Research_Participant_ID": error_data_2["Research_Participant_ID"], "Visit_Num": 'All',
                                   'Error_Message': "Participant exists in Accrual_Visit_Info.csv but is missing from Accrual_Participant_Info.csv "})
+                                  
+    part_errors = pd.concat([part_errors_1, part_errors_2])
 
     check_visit = acc_visit_data.merge(acc_vaccine_data, on=["Research_Participant_ID","Visit_Number"], how="outer", indicator="Part_Vacc")
     visit_errors = check_visit.query("Part_Vacc in ['left_only']")   # flags data were participant not in visit or vise vera
@@ -153,13 +163,14 @@ def lambda_handler(event, context):
         email_msg = email_msg + "\n      Attachment: Cross_Sheet_Errors_Found.csv has list of errors found"
         email_msg = email_msg + "\n\nPlease correct these discrepancies and resubmit the accrual submission"
         
-        make_attachment(ssm, sub_name, s3_client, all_error_data, bucket, error_key, email_msg, "Cross_Sheet_Errors_Found.csv", slack_pass, slack_fail)
+        make_attachment(ssm, sub_name, s3_client, all_error_data, bucket, error_key, email_msg, 
+                        "Cross_Sheet_Errors_Found.csv", slack_pass, slack_fail, file_path, pass_bucket, fail_bucket, s3_resource, site_name)
         return
 ######################################################################################################################################   
 ## validation step 5: Validate the Accrual Participant file
     all_error_data  = []
     try:
-        part_errors = check_part_rules(acc_participant_data, cbc_name_list[curr_cbc])
+        part_errors = check_part_rules(acc_participant_data, cbc_name_list[curr_cbc][1])
     except Exception as e:
         email_msg = email_msg + "\n5) Analysis of Accrual_Participant_Info: Failed"
         email_msg = email_msg + f"\n         {e}"
@@ -167,7 +178,7 @@ def lambda_handler(event, context):
     all_error_data = get_error_data(all_error_data, part_errors)
        
     try:  
-        visit_errors = check_visit_rules(acc_visit_data, cbc_name_list[curr_cbc])
+        visit_errors = check_visit_rules(acc_visit_data, cbc_name_list[curr_cbc][1])
     except Exception as e:
         email_msg = email_msg + "\n6) Analysis of Accrual_Visit_Info: Failed"
         email_msg = email_msg + f"\n         {e}"
@@ -175,7 +186,7 @@ def lambda_handler(event, context):
     all_error_data = get_error_data(all_error_data, visit_errors)
  
     try:
-        vaccine_errors = check_vaccine_rules(acc_vaccine_data, cbc_name_list[curr_cbc])
+        vaccine_errors = check_vaccine_rules(acc_vaccine_data, cbc_name_list[curr_cbc][1])
     except Exception as e:
         vaccine_errors = -1
         email_msg = email_msg + "\n7) Analysis of Accrual_Vaccination_Status: Failed"
@@ -201,7 +212,8 @@ def lambda_handler(event, context):
         email_msg = email_msg + "\n7) Analysis of Accrual_Vaccination_Status: Passed"
 
     error_key = file_path.replace("File_Validation_Results/Result_Message.txt", "Data_Errors/Accrual_Error_Report.csv")
-    make_attachment(ssm, sub_name, s3_client, all_error_data, bucket, error_key, email_msg, "Accrual_Error_Report.csv", slack_pass, slack_fail)
+    make_attachment(ssm, sub_name, s3_client, all_error_data, bucket, error_key, email_msg,
+                    "Accrual_Error_Report.csv", slack_pass, slack_fail, file_path, pass_bucket, fail_bucket, s3_resource, site_name)
 
 def get_error_data(error_df, file_df):
     if isinstance(file_df, pd.DataFrame):
@@ -211,7 +223,7 @@ def get_error_data(error_df, file_df):
             error_df = pd.concat([error_df, file_df])
     return error_df
 
-def make_attachment(ssm, sub_name, s3_client, all_error_data, bucket, error_key, email_msg, file_name, slack_pass, slack_fail):
+def make_attachment(ssm, sub_name, s3_client, all_error_data, bucket, error_key, email_msg, file_name, slack_pass, slack_fail, file_path, pass_bucket, fail_bucket, s3_resource, site_name):
     if len(all_error_data) > 0:
         wr.s3.to_csv(df=all_error_data,    path=f's3://{bucket}/{error_key}')       #write file to s3
         file_attach = s3_client.get_object(Bucket=bucket, Key=error_key)
@@ -222,7 +234,8 @@ def make_attachment(ssm, sub_name, s3_client, all_error_data, bucket, error_key,
         attachment.add_header('Content-Disposition', 'attachment', filename=file_name)
     else:
         attachment = []     # no errors found so no file to attach
-    send_error_email(ssm, sub_name, attachment, all_error_data, email_msg, slack_pass, slack_fail)     
+    send_error_email(ssm, sub_name, attachment, all_error_data, email_msg, slack_pass, slack_fail, bucket,
+                     file_path, pass_bucket, fail_bucket, s3_client, s3_resource, site_name)     
 ###########################################################################################################################################
 def load_data(s3_client, bucket, file_path, file_name, missing_list):
     part_key = file_path.replace("File_Validation_Results/Result_Message.txt", "UnZipped_Files/" + file_name)
@@ -265,7 +278,7 @@ def make_csv(df):
         df.to_csv(buffer)
         return buffer.getvalue()
         
-def send_error_email(ssm, file_name, attachment, error_list, email_msg, slack_pass, slack_fail):
+def send_error_email(ssm, file_name, attachment, error_list, email_msg, slack_pass, slack_fail, bucket, file_path, pass_bucket, fail_bucket, s3_client, s3_resource, site_name):
     http = urllib3.PoolManager()
     USERNAME_SMTP = ssm.get_parameter(Name="USERNAME_SMTP", WithDecryption=True).get("Parameter").get("Value")
     PASSWORD_SMTP = ssm.get_parameter(Name="PASSWORD_SMTP", WithDecryption=True).get("Parameter").get("Value")
@@ -298,11 +311,21 @@ def send_error_email(ssm, file_name, attachment, error_list, email_msg, slack_pa
             
             send_email_func(HOST, PORT, USERNAME_SMTP, PASSWORD_SMTP, SENDER, recipient, msg)
             print("email has been sent")
+            
+            if len(error_list) > 0:
+                move_submission(file_name, error_list, bucket, fail_bucket, file_path, s3_client, s3_resource, site_name)
+            elif len(error_list) == 0:
+                move_submission(file_name, error_list, bucket, pass_bucket, file_path, s3_client, s3_resource, site_name)
+            else: 
+                print("unable to move submission due to negative error value")
+                       
             data={"text": email_msg}
             r=http.request("POST", slack_pass, body=json.dumps(data), headers={"Content-Type":"application/json"})
+            print("submission has been moved")
     except Exception as e:
-        data={"text": display_error_line(e)}
-        r=http.request("POST", slack_fail, body=json.dumps(data), headers={"Content-Type":"application/json"})
+        print(e)
+        #data={"text": display_error_line(e)}
+        #r=http.request("POST", slack_fail, body=json.dumps(data), headers={"Content-Type":"application/json"})
 
 def send_email_func(HOST, PORT, USERNAME_SMTP, PASSWORD_SMTP, SENDER, recipient, msg):
     server = smtplib.SMTP(HOST, PORT)
@@ -315,6 +338,25 @@ def send_email_func(HOST, PORT, USERNAME_SMTP, PASSWORD_SMTP, SENDER, recipient,
     server.sendmail(SENDER, recipient, msg.as_string())
     server.close()
 
+def move_submission(file_name, error_list, curr_bucket, new_bucket, file_path, s3_client, s3_resource, site_name):
+    # curr_bucket = seronet-demo-cbc-destination
+    # file_path = "Accrual_Need_To_Validate/cbc02/2023-05-09-10-27-51/submission_007_accrual_submission_5_9_23.zip/"
+    
+    all_files = s3_client.list_objects_v2(Bucket=curr_bucket, Prefix=file_path[:30])["Contents"]
+    all_files = [i["Key"] for i in all_files]
+
+    for curr_key in all_files:  
+        new_key = curr_key.replace("Accrual_Need_To_Validate", f"Monthly_Accrual_Reports/{site_name}")
+        
+        source = {'Bucket': curr_bucket, 'Key': curr_key}               # files to copy
+        try:
+            s3_resource.meta.client.copy(source, new_bucket, new_key)
+            print(f"atempting to delete {bucket} / {curr_key}")
+            s3_client.delete_object(Bucket=curr_bucket, Key=curr_key)
+            
+        except Exception as error:
+            print('Error Message: {}'.format(error))
+        
 def convert_data_type(v):
     if isinstance(v, (datetime.datetime, datetime.time, datetime.date)):
         return v
