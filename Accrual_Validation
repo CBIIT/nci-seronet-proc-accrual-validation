@@ -29,8 +29,10 @@ def lambda_handler(event, context):
     cbc_name_list = {"cbc01" : ["Feinstein_CBC01", 41], "cbc02": ["UMN_CBC02", 27], "cbc03": ["ASU_CBC03", 32], "cbc04": ["Mt_Sinai_CBC04",14]}  
 
     passing_msg = ("File is a valid Zipfile. No errors were found in submission. Files are good to proceed to Data Validation")
-    pass_bucket = "seronet-trigger-submissions-passed"
-    fail_bucket = "seronet-demo-submissions-failed"
+    #pass_bucket = "seronet-trigger-submissions-passed"
+    #fail_bucket = "seronet-demo-submissions-failed"
+    pass_bucket = ssm.get_parameter(Name="pass_bucket", WithDecryption=True).get("Parameter").get("Value")
+    fail_bucket = ssm.get_parameter(Name="fail_bucket", WithDecryption=True).get("Parameter").get("Value")
 ###################################################################################################################################
     #set up success and failure slack channel
     slack_fail = ssm.get_parameter(Name="failure_hook_url", WithDecryption=True).get("Parameter").get("Value")
