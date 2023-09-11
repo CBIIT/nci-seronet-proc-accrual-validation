@@ -41,6 +41,8 @@ def lambda_handler(event, context):
     bucket = event["Records"][0]["s3"]["bucket"]["name"]
     file_path = event["Records"][0]["s3"]["object"]["key"]
     # Accrual_Need_To_Validate/cbc01/2023-04-20-12-59-25/submission_007_Prod_data_for_feinstein20230420_VaccinationProject_Batch9_shippingmanifest.zip/File_Validation_Results/Result_Message.txt
+    file_path = file_path.replace("+", " ")         #some submissions might have spaces this line corrects the "+" replacement
+    
     
     curr_cbc = file_path.split("/")[1]
     sub_name = file_path.split("/")[3][15:]
@@ -215,7 +217,7 @@ def lambda_handler(event, context):
 
     error_key = file_path.replace("File_Validation_Results/Result_Message.txt", "Data_Errors/Accrual_Error_Report.csv")
     make_attachment(ssm, sub_name, s3_client, all_error_data, bucket, error_key, email_msg,
-                    "Accrual_Error_Report.csv", slack_pass, slack_fail, file_path, pass_bucket, fail_bucket, s3_resource, site_name)
+                    "Accrual_Error_Report.csv", slack_pass, slack_fail, file_path, pass_bucket, fail_bucket, s3_resource, site_name, curr_cbc)
 
 def get_error_data(error_df, file_df):
     if isinstance(file_df, pd.DataFrame):
@@ -225,7 +227,7 @@ def get_error_data(error_df, file_df):
             error_df = pd.concat([error_df, file_df])
     return error_df
 
-def make_attachment(ssm, sub_name, s3_client, all_error_data, bucket, error_key, email_msg, file_name, slack_pass, slack_fail, file_path, pass_bucket, fail_bucket, s3_resource, site_name):
+def make_attachment(ssm, sub_name, s3_client, all_error_data, bucket, error_key, email_msg, file_name, slack_pass, slack_fail, file_path, pass_bucket, fail_bucket, s3_resource, site_name, curr_cbc):
     if len(all_error_data) > 0:
         wr.s3.to_csv(df=all_error_data,    path=f's3://{bucket}/{error_key}')       #write file to s3
         file_attach = s3_client.get_object(Bucket=bucket, Key=error_key)
@@ -237,7 +239,7 @@ def make_attachment(ssm, sub_name, s3_client, all_error_data, bucket, error_key,
     else:
         attachment = []     # no errors found so no file to attach
     send_error_email(ssm, sub_name, attachment, all_error_data, email_msg, slack_pass, slack_fail, bucket,
-                     file_path, pass_bucket, fail_bucket, s3_client, s3_resource, site_name)     
+                     file_path, pass_bucket, fail_bucket, s3_client, s3_resource, site_name, curr_cbc)     
 ###########################################################################################################################################
 def load_data(s3_client, bucket, file_path, file_name, missing_list):
     part_key = file_path.replace("File_Validation_Results/Result_Message.txt", "UnZipped_Files/" + file_name)
@@ -280,7 +282,7 @@ def make_csv(df):
         df.to_csv(buffer)
         return buffer.getvalue()
         
-def send_error_email(ssm, file_name, attachment, error_list, email_msg, slack_pass, slack_fail, bucket, file_path, pass_bucket, fail_bucket, s3_client, s3_resource, site_name):
+def send_error_email(ssm, file_name, attachment, error_list, email_msg, slack_pass, slack_fail, bucket, file_path, pass_bucket, fail_bucket, s3_client, s3_resource, site_name, curr_cbc):
     http = urllib3.PoolManager()
     USERNAME_SMTP = ssm.get_parameter(Name="USERNAME_SMTP", WithDecryption=True).get("Parameter").get("Value")
     PASSWORD_SMTP = ssm.get_parameter(Name="PASSWORD_SMTP", WithDecryption=True).get("Parameter").get("Value")
@@ -315,9 +317,9 @@ def send_error_email(ssm, file_name, attachment, error_list, email_msg, slack_pa
             print("email has been sent")
             
             if len(error_list) > 0:
-                move_submission(file_name, error_list, bucket, fail_bucket, file_path, s3_client, s3_resource, site_name)
+                move_submission(file_name, error_list, bucket, fail_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc)
             elif len(error_list) == 0:
-                move_submission(file_name, error_list, bucket, pass_bucket, file_path, s3_client, s3_resource, site_name)
+                move_submission(file_name, error_list, bucket, pass_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc)
             else: 
                 print("unable to move submission due to negative error value")
                        
@@ -340,20 +342,24 @@ def send_email_func(HOST, PORT, USERNAME_SMTP, PASSWORD_SMTP, SENDER, recipient,
     server.sendmail(SENDER, recipient, msg.as_string())
     server.close()
 
-def move_submission(file_name, error_list, curr_bucket, new_bucket, file_path, s3_client, s3_resource, site_name):
+def move_submission(file_name, error_list, curr_bucket, new_bucket, file_path, s3_client, s3_resource, site_name, curr_cbc):
     # curr_bucket = seronet-demo-cbc-destination
     # file_path = "Accrual_Need_To_Validate/cbc02/2023-05-09-10-27-51/submission_007_accrual_submission_5_9_23.zip/"
-    
+    # make sure the submission csv is the last one to be moved
     all_files = s3_client.list_objects_v2(Bucket=curr_bucket, Prefix=file_path[:30])["Contents"]
-    all_files = [i["Key"] for i in all_files]
+    sub_files = [i["Key"] for i in all_files if "UnZipped_Files/submission.csv" not in i["Key"]]
+    submission_csv_key = [i["Key"] for i in all_files if "UnZipped_Files/submission.csv" in i["Key"]]
+    sub_files.append(submission_csv_key[0])
+    cbc_key = curr_cbc + "/"
+    print(sub_files)
 
-    for curr_key in all_files:  
+    for curr_key in sub_files:  
         new_key = curr_key.replace("Accrual_Need_To_Validate", f"Monthly_Accrual_Reports/{site_name}")
-        
+        new_key = new_key.replace(cbc_key, "")
         source = {'Bucket': curr_bucket, 'Key': curr_key}               # files to copy
         try:
             s3_resource.meta.client.copy(source, new_bucket, new_key)
-            print(f"atempting to delete {bucket} / {curr_key}")
+            print(f"atempting to delete {curr_bucket}/{curr_key}")
             s3_client.delete_object(Bucket=curr_bucket, Key=curr_key)
             
         except Exception as error:
@@ -512,7 +518,8 @@ def check_vaccine_rules(vaccine_data, cbc_id):
             if curr_col in ['Vaccination_Status']:
                 list_values = (['Unvaccinated', 'No vaccination event reported', 'Dose 1 of 1', 'Dose 1 of 2', 'Dose 2 of 2', 'Dose 2', 'Dose 3', 'Dose 4'] +
                               ["Booster " + str(i) for i in list(range(1,10))] + 
-                              ["Booster " + str(i) + ":Bivalent" for i in list(range(1,10))])
+                              ["Booster " + str(i) + ":Bivalent" for i in list(range(1,10))] + 
+                              ["Dose " + str(i) + ":Bivalent" for i in list(range(3,10))])
             if curr_col in ['SARS-CoV-2_Vaccine_Type']:
                 list_values = ['Johnson & Johnson', 'Moderna', 'Pfizer', 'Unknown', 'N/A', 'Janssen', 'Sputnik V']
             if (curr_col in ['Visit_Number']):
